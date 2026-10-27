@@ -1,0 +1,10 @@
+name = "spotify-tg-bot"
+main = "src/index.js"
+compatibility_date = "2026-10-27"
+
+[triggers]
+crons = ["*/2 * * * *"]
+
+[[kv_namespaces]]
+binding = "KV"
+id = "b0b2571c3fd14e8f981fcfa09b6057e1" # ID отримаєш на кроці розгортання
