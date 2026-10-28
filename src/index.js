@@ -1,15 +1,13 @@
 export default {
   async scheduled(event, env, ctx) {
-    // ⚠️ Обов'язково await, щоб Worker не вбивав процес завчасно
     await processSpotifyLikes(env);
   },
 };
 
 async function processSpotifyLikes(env) {
-  // Замок у KV (TTL 180с) для захисту від паралельних кронів
   const lock = await env.KV.get('sync_lock');
   if (lock) {
-    console.log('Lock exists. Exiting.');
+    console.log('[DEBUG] Lock exists in KV. Exiting run.');
     return;
   }
   await env.KV.put('sync_lock', '1', { expirationTtl: 180 });
@@ -17,18 +15,34 @@ async function processSpotifyLikes(env) {
   try {
     const accessToken = await refreshSpotifyToken(env);
 
-    // ⚠️ Валідний limit = 10 (Spotify API 2026)
     const tracksRes = await spotifyFetch(
       'https://api.spotify.com/v1/me/tracks?limit=10',
       accessToken,
     );
-    if (!tracksRes || !tracksRes.items || tracksRes.items.length === 0)
+    if (
+      !tracksRes ||
+      !tracksRes.items ||
+      tracksRes.items.length === 0
+    ) {
+      console.log('[DEBUG] Spotify returned 0 tracks.');
       return;
+    }
 
     let state = await env.KV.get('spotify_state', 'json');
-    if (!state) state = { ts: '1970-01-01T00:00:00Z', ids: [] };
 
-    // ⚠️ Поле items замість tracks
+    if (!state) {
+      const latestTrackItem = tracksRes.items[0];
+      state = {
+        ts: latestTrackItem.added_at,
+        ids: [latestTrackItem.track.id],
+      };
+      await env.KV.put('spotify_state', JSON.stringify(state));
+      console.log(
+        `[DEBUG] Initialized state to latest track "${latestTrackItem.track.name}". Ready for NEW likes.`,
+      );
+      return;
+    }
+
     const items = tracksRes.items.reverse();
 
     const targetItem = items.find((item) => {
@@ -40,82 +54,49 @@ async function processSpotifyLikes(env) {
     });
 
     if (!targetItem) {
-      console.log('No new tracks.');
+      console.log(
+        '[DEBUG] No new tracks found (compared to KV state TS).',
+      );
       return;
     }
 
     const track = targetItem.track;
     const addedAt = targetItem.added_at;
-    const artistName = track.artists[0].name;
+
     const trackName = track.name;
+    const year = track.album?.release_date
+      ? track.album.release_date.substring(0, 4)
+      : 'невідомо';
+    const albumName =
+      track.album?.album_type === 'single'
+        ? 'сінгл'
+        : track.album?.name || 'невідомо';
 
-    // Метадані: Beatport -> Discogs -> не знайдено
-    let metadata = await searchBeatport(artistName, trackName);
-    if (!metadata) {
-      metadata = await searchDiscogs(
-        artistName,
-        trackName,
-        env.DISCOGS_KEY,
-        env.DISCOGS_SECRET,
-      );
-    }
-    if (!metadata) {
-      metadata = {
-        style: 'не знайдено',
-        label: 'не знайдено',
-        year: 'не знайдено',
-        bpm: 'не знайдено',
-        key: 'не знайдено',
-      };
-    }
+    const artistsObjects = track.artists || [];
+    const artistsNames = artistsObjects.map((a) => a.name);
 
-    // LLM генерація (описи та країна)
-    const llmData = await getLLMData(
-      artistName,
-      metadata.label,
-      env.GEMINI_API_KEY,
+    console.log(
+      `[DEBUG] Processing new track: "${trackName}" by ${artistsNames.join(', ')}`,
     );
 
-    // Плейлісти
-    const playlists = await getAllSpotifyPlaylists(accessToken);
-    const playlistsLinks = [];
+    const llmData = await getLLMData(artistsNames, env.GEMINI_API_KEY);
 
-    if (metadata.style !== 'не знайдено') {
-      const styleLink = await addTrackToPlaylist(
-        metadata.style,
-        track.uri,
-        playlists,
-        accessToken,
+    if (!llmData) {
+      console.log(
+        '[DEBUG] LLM data unavailable on all models. Retrying on next cron run in 2 minutes.',
       );
-      playlistsLinks.push(
-        `<a href="${styleLink}">${metadata.style}</a>`,
-      );
+      return;
     }
 
-    if (metadata.label !== 'не знайдено') {
-      const labelLink = await addTrackToPlaylist(
-        metadata.label,
-        track.uri,
-        playlists,
-        accessToken,
-      );
-      playlistsLinks.push(
-        `<a href="${labelLink}">${metadata.label}</a>`,
-      );
-    }
-
-    // Telegram пост
     await sendTelegramMessage(
       env,
-      artistName,
       trackName,
-      metadata,
+      albumName,
+      year,
       llmData,
-      playlistsLinks,
       track.external_urls?.spotify,
     );
 
-    // Оновлення стану без безкінечного масиву
     if (addedAt === state.ts) {
       state.ids.push(track.id);
     } else {
@@ -123,6 +104,9 @@ async function processSpotifyLikes(env) {
       state.ids = [track.id];
     }
     await env.KV.put('spotify_state', JSON.stringify(state));
+    console.log(
+      `[DEBUG] Successfully processed and updated KV state to TS: ${state.ts}`,
+    );
   } catch (error) {
     console.error('Error in processSpotifyLikes:', error);
   } finally {
@@ -148,7 +132,10 @@ async function refreshSpotifyToken(env) {
     body: params.toString(),
   });
   const data = await res.json();
-  if (!res.ok) throw new Error('Failed to refresh Spotify token');
+  if (!res.ok)
+    throw new Error(
+      `Failed to refresh Spotify token: ${JSON.stringify(data)}`,
+    );
   return data.access_token;
 }
 
@@ -180,220 +167,126 @@ async function spotifyFetch(url, token, options = {}) {
   return await res.json();
 }
 
-async function getAllSpotifyPlaylists(token) {
-  let url = 'https://api.spotify.com/v1/me/playlists?limit=50';
-  const allPlaylists = [];
-
-  while (url) {
-    const data = await spotifyFetch(url, token);
-    if (data.items) {
-      allPlaylists.push(...data.items);
-    }
-    url = data.next;
-  }
-
-  return allPlaylists;
-}
-
-async function addTrackToPlaylist(
-  playlistName,
-  trackUri,
-  allPlaylists,
-  token,
-) {
-  let playlist = allPlaylists.find(
-    (p) => p.name.toLowerCase() === playlistName.toLowerCase(),
-  );
-
-  if (!playlist) {
-    // ⚠️ Новий ендпойнт POST /me/playlists
-    const newPlRes = await fetch(
-      'https://api.spotify.com/v1/me/playlists',
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ name: playlistName, public: false }),
-      },
-    );
-
-    if (newPlRes.status === 429)
-      throw new Error('429 on playlist creation');
-    playlist = await newPlRes.json();
-  }
-
-  // ⚠️ Новий ендпойнт /playlists/{id}/items
-  const addRes = await fetch(
-    `https://api.spotify.com/v1/playlists/${playlist.id}/items`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ uris: [trackUri] }),
-    },
-  );
-
-  if (addRes.status === 429)
-    throw new Error('429 on adding track to playlist');
-
-  return playlist.external_urls.spotify;
-}
-
-async function searchBeatport(artist, title) {
-  try {
-    const q = `${artist} ${title}`;
-    const res = await fetch(
-      `https://www.beatport.com/search/tracks?q=${encodeURIComponent(q)}`,
-    );
-    const html = await res.text();
-
-    const match = html.match(
-      /<script id="__NEXT_DATA__" type="application\/json">(.*?)<\/script>/,
-    );
-    if (!match) return null;
-
-    const nextData = JSON.parse(match[1]);
-    let trackObj = findObjWithKeys(nextData, ['track_name', 'bpm']);
-    if (!trackObj) return null;
-
-    return {
-      style: trackObj.genre?.name || 'не знайдено',
-      label: trackObj.label?.name || 'не знайдено',
-      year: trackObj.release_date
-        ? trackObj.release_date.substring(0, 4)
-        : 'не знайдено',
-      bpm: trackObj.bpm || 'не знайдено',
-      key: trackObj.key?.name || 'не знайдено',
-    };
-  } catch (e) {
+async function getLLMData(artistsNames, apiKey) {
+  if (!apiKey) {
+    console.error('[DEBUG] GEMINI_API_KEY is missing!');
     return null;
   }
-}
 
-function findObjWithKeys(obj, keys) {
-  if (!obj || typeof obj !== 'object') return null;
-  if (keys.every((k) => k in obj)) return obj;
-  for (const k of Object.keys(obj)) {
-    const result = findObjWithKeys(obj[k], keys);
-    if (result) return result;
+  const prompt = `Проаналізуй наступних музичних виконавців: ${artistsNames.join(', ')}.
+Для КОЖНОГО виконавця надай таку інформацію:
+1. Коротка інформація (стиль, історія, звідки вони, чим відомі - 1-2 абзаци).
+2. Найпопулярніший трек цього виконавця.
+3. Найпопулярніший альбом цього виконавця (або EP).
+
+Якщо інформації про когось немає, пиши "Інформації не знайдено", НЕ вигадуй факти.
+Відповідь дай СУВОРО у форматі JSON (масив об'єктів під ключем "artists_info"):
+{
+  "artists_info": [
+    {
+      "name": "Ім'я виконавця",
+      "bio": "коротка інформація...",
+      "top_track": "Назва найпопулярнішого треку",
+      "top_album": "Назва найпопулярнішого альбому"
+    }
+  ]
+}`;
+
+  const models = ['gemini-3.8-flash', 'gemini-3.5-flash-lite'];
+
+  for (const model of models) {
+    try {
+      console.log(`[DEBUG] Calling Gemini API with model: ${model}`);
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              response_mime_type: 'application/json',
+            },
+          }),
+        },
+      );
+
+      const data = await res.json();
+      if (res.ok) {
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (text) {
+          const parsed = JSON.parse(text);
+          if (parsed.artists_info) {
+            console.log(
+              `[DEBUG] Gemini call successful using ${model}!`,
+            );
+            return parsed.artists_info;
+          }
+        }
+      } else {
+        console.error(
+          `[DEBUG] Gemini Error (${model}):`,
+          JSON.stringify(data),
+        );
+        // Якщо помилка 503 або 429, цикл автоматично перейде до наступної, легшої моделі
+        if (res.status === 503 || res.status === 429) {
+          console.log(
+            `[DEBUG] ${model} is unavailable. Switching to fallback...`,
+          );
+          continue;
+        }
+      }
+    } catch (e) {
+      console.error(
+        `[DEBUG] Gemini Exception (${model}):`,
+        e.message || e,
+      );
+    }
   }
+
   return null;
 }
 
-async function searchDiscogs(artist, title, key, secret) {
-  if (!key || !secret) return null;
-  try {
-    const q = `${artist} ${title}`;
-    const res = await fetch(
-      `https://api.discogs.com/database/search?q=${encodeURIComponent(q)}&type=release`,
-      {
-        headers: {
-          'User-Agent': 'SpotifyTelegramBot/1.0',
-          Authorization: `Discogs key=${key}, secret=${secret}`,
-        },
-      },
-    );
-    const data = await res.json();
-    if (!data.results || data.results.length === 0) return null;
-
-    const release = data.results[0];
-    return {
-      style:
-        (release.style && release.style[0]) ||
-        (release.genre && release.genre[0]) ||
-        'не знайдено',
-      label: (release.label && release.label[0]) || 'не знайдено',
-      year: release.year || 'не знайдено',
-      bpm: 'не знайдено',
-      key: 'не знайдено',
-    };
-  } catch (e) {
-    return null;
-  }
-}
-
-async function getLLMData(artist, label, apiKey) {
-  if (!apiKey)
-    return {
-      artist_desc: 'LLM вимкнено',
-      label_desc: 'LLM вимкнено',
-      country: 'не знайдено',
-    };
-
-  const prompt = `Проаналізуй артиста "${artist}" та лейбл "${label}".
-1. Напиши опис артиста (1-2 абзаци, жива мова: хто заснував, коли, місто, чим відомі). 
-2. Напиши опис лейбла (1-2 абзаци: історія, фокус).
-3. Визнач країну артиста. Не використовуй регулярні вирази, опирайся на свої знання. 
-
-Якщо інформації немає взагалі — пиши "Інформації не знайдено", НЕ вигадуй факти.
-Відповідь дай СУВОРО у форматі JSON:
-{
-  "artist_desc": "опис",
-  "label_desc": "опис",
-  "country": "Назва країни українською (або 'не знайдено')"
-}`;
-
-  try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { response_mime_type: 'application/json' },
-        }),
-      },
-    );
-    const data = await res.json();
-    const text = data.candidates[0].content.parts[0].text;
-    return JSON.parse(text);
-  } catch (e) {
-    return {
-      artist_desc: 'Помилка LLM',
-      label_desc: 'Помилка LLM',
-      country: 'не знайдено',
-    };
-  }
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 async function sendTelegramMessage(
   env,
-  artist,
-  title,
-  meta,
-  llm,
-  playlistsLinks,
+  trackName,
+  albumName,
+  year,
+  llmData,
   spotifyUrl,
 ) {
-  const playlistsHtml =
-    playlistsLinks.length > 0
-      ? playlistsLinks.join(' | ')
-      : '<i>Не створено</i>';
+  const allArtistNames = llmData.map((a) => a.name).join(', ');
+
+  const artistsHtml = llmData
+    .map((artist) =>
+      `
+<b>👤 ${escapeHtml(artist.name)}</b>
+${escapeHtml(artist.bio)}
+🏆 Найпопулярніший трек: <i>${escapeHtml(artist.top_track)}</i>
+💿 Найпопулярніший альбом: <i>${escapeHtml(artist.top_album)}</i>
+  `.trim(),
+    )
+    .join('\n\n');
 
   const text = `
-<b>🎵 <a href="${spotifyUrl}">${artist} — ${title}</a></b>
+<b>🎵 <a href="${spotifyUrl}">${escapeHtml(allArtistNames)} — ${escapeHtml(trackName)}</a></b>
 
-<b>BPM:</b> ${meta.bpm} | <b>Тональність:</b> ${meta.key}
-<b>Рік:</b> ${meta.year} | <b>Стиль:</b> ${meta.style}
-<b>Лейбл:</b> ${meta.label}
-<b>Країна:</b> ${llm.country}
+<b>Альбом:</b> ${escapeHtml(albumName)}
+<b>Рік:</b> ${escapeHtml(year)}
 
-<b>👤 Про артиста:</b>
-${llm.artist_desc}
-
-<b>📀 Про лейбл:</b>
-${llm.label_desc}
-
-<b>📂 Плейлісти:</b>
-${playlistsHtml}
+${artistsHtml}
   `.trim();
 
-  await fetch(
+  const res = await fetch(
     `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`,
     {
       method: 'POST',
@@ -406,4 +299,14 @@ ${playlistsHtml}
       }),
     },
   );
+
+  const tgData = await res.json();
+  if (!res.ok || !tgData.ok) {
+    console.error(
+      '[DEBUG] Telegram API Error:',
+      JSON.stringify(tgData),
+    );
+  } else {
+    console.log('[DEBUG] Telegram message sent successfully!');
+  }
 }
