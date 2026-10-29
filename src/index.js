@@ -2,6 +2,22 @@ export default {
   async scheduled(event, env, ctx) {
     await processSpotifyLikes(env);
   },
+
+  async fetch(request, env, ctx) {
+    if (request.method === 'POST') {
+      try {
+        const update = await request.json();
+        if (update.callback_query) {
+          await handleCallbackQuery(env, update.callback_query);
+        }
+        return new Response('OK', { status: 200 });
+      } catch (e) {
+        console.error('[DEBUG] Fetch error:', e);
+        return new Response('Error', { status: 500 });
+      }
+    }
+    return new Response('Spotify TG Bot is running!', { status: 200 });
+  },
 };
 
 async function processSpotifyLikes(env) {
@@ -71,6 +87,7 @@ async function processSpotifyLikes(env) {
       track.album?.album_type === 'single'
         ? 'сінгл'
         : track.album?.name || 'невідомо';
+    const trackCoverUrl = track.album?.images?.[0]?.url || null;
 
     const artistsObjects = track.artists || [];
     const artistsNames = artistsObjects.map((a) => a.name);
@@ -83,18 +100,31 @@ async function processSpotifyLikes(env) {
 
     if (!llmData) {
       console.log(
-        '[DEBUG] LLM data unavailable on all models. Retrying on next cron run in 2 minutes.',
+        '[DEBUG] LLM data unavailable. Retrying on next cron run in 2 minutes.',
       );
       return;
     }
 
-    await sendTelegramMessage(
+    const trackDataKey = `track_data_${track.id}`;
+    await env.KV.put(
+      trackDataKey,
+      JSON.stringify({
+        artists: llmData,
+        artistsObjects: artistsObjects,
+        accessToken: accessToken,
+      }),
+      { expirationTtl: 86400 },
+    );
+
+    await sendMainTrackMessage(
       env,
       trackName,
       albumName,
       year,
-      llmData,
+      artistsNames,
       track.external_urls?.spotify,
+      trackCoverUrl,
+      track.id,
     );
 
     if (addedAt === state.ts) {
@@ -167,38 +197,53 @@ async function spotifyFetch(url, token, options = {}) {
   return await res.json();
 }
 
+async function getArtistData(artistId, token) {
+  try {
+    return await spotifyFetch(
+      `https://api.spotify.com/v1/artists/${artistId}`,
+      token,
+    );
+  } catch (e) {
+    console.error('[DEBUG] Failed to fetch artist data:', e);
+    return null;
+  }
+}
+
 async function getLLMData(artistsNames, apiKey) {
   if (!apiKey) {
     console.error('[DEBUG] GEMINI_API_KEY is missing!');
     return null;
   }
 
-  const prompt = `Проаналізуй наступних музичних виконавців: ${artistsNames.join(', ')}.
-Для КОЖНОГО виконавця надай таку інформацію:
-1. Коротка інформація (стиль, історія, звідки вони, чим відомі - 1-2 абзаци).
-2. Найпопулярніший трек цього виконавця.
-3. Найпопулярніший альбом цього виконавця (або EP).
+  const prompt = `Проаналізуй музичних виконавців: ${artistsNames.join(', ')}.
+Для кожного надай:
+1. Повна біографія (стиль, історія, чим відомі - 1-2 абзаци).
+2. Найпопулярніший трек.
+3. Найпопулярний альбом.
 
-Якщо інформації про когось немає, пиши "Інформації не знайдено", НЕ вигадуй факти.
-Відповідь дай СУВОРО у форматі JSON (масив об'єктів під ключем "artists_info"):
+Дай відповідь СУВОРО у форматі JSON:
 {
   "artists_info": [
     {
-      "name": "Ім'я виконавця",
-      "bio": "коротка інформація...",
-      "top_track": "Назва найпопулярнішого треку",
-      "top_album": "Назва найпопулярнішого альбому"
+      "name": "Ім'я",
+      "bio": "опис...",
+      "top_track": "Трек",
+      "top_album": "Альбом"
     }
   ]
 }`;
 
-  const models = ['gemini-3.8-flash', 'gemini-3.5-flash-lite'];
-
-  for (const model of models) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      console.log(`[DEBUG] Calling Gemini API with model: ${model}`);
+      console.log(
+        `[DEBUG] Calling Gemini API (gemini-3.5-flash-lite), attempt ${attempt}/3`,
+      );
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 25000);
+
       const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${apiKey}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -208,37 +253,44 @@ async function getLLMData(artistsNames, apiKey) {
               response_mime_type: 'application/json',
             },
           }),
+          signal: controller.signal,
         },
       );
+      clearTimeout(timeoutId);
 
-      const data = await res.json();
+      const textData = await res.text();
+      let data;
+      try {
+        data = JSON.parse(textData);
+      } catch (parseErr) {
+        throw new Error(
+          `Non-JSON response received: ${textData.substring(0, 100)}`,
+        );
+      }
+
       if (res.ok) {
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
         if (text) {
           const parsed = JSON.parse(text);
           if (parsed.artists_info) {
             console.log(
-              `[DEBUG] Gemini call successful using ${model}!`,
+              `[DEBUG] Gemini call successful on attempt ${attempt}!`,
             );
             return parsed.artists_info;
           }
         }
       } else {
         console.error(
-          `[DEBUG] Gemini Error (${model}):`,
+          `[DEBUG] Gemini Error (Attempt ${attempt}):`,
           JSON.stringify(data),
         );
-        // Якщо помилка 503 або 429, цикл автоматично перейде до наступної, легшої моделі
         if (res.status === 503 || res.status === 429) {
-          console.log(
-            `[DEBUG] ${model} is unavailable. Switching to fallback...`,
-          );
-          continue;
+          await new Promise((r) => setTimeout(r, 2000 * attempt));
         }
       }
     } catch (e) {
       console.error(
-        `[DEBUG] Gemini Exception (${model}):`,
+        `[DEBUG] Gemini Exception (Attempt ${attempt}):`,
         e.message || e,
       );
     }
@@ -256,57 +308,158 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;');
 }
 
-async function sendTelegramMessage(
+async function sendMainTrackMessage(
   env,
   trackName,
   albumName,
   year,
-  llmData,
+  artistsNames,
   spotifyUrl,
+  coverUrl,
+  trackId,
 ) {
-  const allArtistNames = llmData.map((a) => a.name).join(', ');
-
-  const artistsHtml = llmData
-    .map((artist) =>
-      `
-<b>👤 ${escapeHtml(artist.name)}</b>
-${escapeHtml(artist.bio)}
-🏆 Найпопулярніший трек: <i>${escapeHtml(artist.top_track)}</i>
-💿 Найпопулярніший альбом: <i>${escapeHtml(artist.top_album)}</i>
-  `.trim(),
-    )
-    .join('\n\n');
+  const artistsList = artistsNames
+    .map((name) => escapeHtml(name))
+    .join(', ');
 
   const text = `
-<b>🎵 <a href="${spotifyUrl}">${escapeHtml(allArtistNames)} — ${escapeHtml(trackName)}</a></b>
+<b>🎵 <a href="${spotifyUrl}">${artistsList} — ${escapeHtml(trackName)}</a></b>
 
+<b>Виконавці:</b> ${artistsList}
 <b>Альбом:</b> ${escapeHtml(albumName)}
 <b>Рік:</b> ${escapeHtml(year)}
-
-${artistsHtml}
   `.trim();
 
+  const inlineKeyboard = {
+    inline_keyboard: [
+      [
+        {
+          text: '📖 Детальніше про виконавців',
+          callback_data: `details_${trackId}`,
+        },
+      ],
+    ],
+  };
+
+  const endpoint = coverUrl ? 'sendPhoto' : 'sendMessage';
+  const payload = {
+    chat_id: env.TG_CHAT_ID,
+    parse_mode: 'HTML',
+    reply_markup: inlineKeyboard,
+  };
+
+  if (coverUrl) {
+    payload.photo = coverUrl;
+    payload.caption = text;
+  } else {
+    payload.text = text;
+    payload.disable_web_page_preview = true;
+  }
+
   const res = await fetch(
-    `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`,
+    `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${endpoint}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: env.TG_CHAT_ID,
-        text: text,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-      }),
+      body: JSON.stringify(payload),
     },
   );
 
   const tgData = await res.json();
   if (!res.ok || !tgData.ok) {
     console.error(
-      '[DEBUG] Telegram API Error:',
+      '[DEBUG] Telegram Main Track Message Error:',
       JSON.stringify(tgData),
     );
   } else {
-    console.log('[DEBUG] Telegram message sent successfully!');
+    console.log('[DEBUG] Main track message sent successfully!');
+  }
+}
+
+async function handleCallbackQuery(env, callbackQuery) {
+  const data = callbackQuery.data;
+  if (!data.startsWith('details_')) return;
+
+  const trackId = data.replace('details_', '');
+  const storedDataStr = await env.KV.get(`track_data_${trackId}`);
+
+  await fetch(
+    `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/answerCallbackQuery`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        callback_query_id: callbackQuery.id,
+        text: 'Завантажую інформацію...',
+      }),
+    },
+  );
+
+  if (!storedDataStr) {
+    await fetch(
+      `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: callbackQuery.message.chat.id,
+          text: "Вибачте, дані про цей трек застаріли або не знайдені в пам'яті.",
+          parse_mode: 'HTML',
+        }),
+      },
+    );
+    return;
+  }
+
+  const { artists, artistsObjects, accessToken } =
+    JSON.parse(storedDataStr);
+
+  for (let i = 0; i < artists.length; i++) {
+    const artistInfo = artists[i];
+    const artistObj = artistsObjects[i];
+
+    const fullArtistData = artistObj?.id
+      ? await getArtistData(artistObj.id, accessToken)
+      : null;
+    const photoUrl = fullArtistData?.images?.[0]?.url || null;
+    const spotifyArtistUrl =
+      fullArtistData?.external_urls?.spotify || '#';
+    const genres = fullArtistData?.genres?.length
+      ? fullArtistData.genres.join(', ')
+      : 'не вказано';
+
+    const text = `
+<b>👤 <a href="${spotifyArtistUrl}">${escapeHtml(artistInfo.name)}</a></b>
+
+<b>Жанри:</b> ${escapeHtml(genres)}
+
+${escapeHtml(artistInfo.bio)}
+
+🏆 Найпопулярніший трек: <i>${escapeHtml(artistInfo.top_track)}</i>
+💿 Найпопулярніший альбом: <i>${escapeHtml(artistInfo.top_album)}</i>
+    `.trim();
+
+    const endpoint = photoUrl ? 'sendPhoto' : 'sendMessage';
+    const payload = {
+      chat_id: callbackQuery.message.chat.id,
+      parse_mode: 'HTML',
+    };
+
+    if (photoUrl) {
+      payload.photo = photoUrl;
+      payload.caption = text;
+    } else {
+      payload.text = text;
+      payload.disable_web_page_preview = true;
+    }
+
+    await fetch(
+      `https://api.telegram.org/bot${env.TG_BOT_TOKEN}/${endpoint}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      },
+    );
   }
 }
