@@ -215,7 +215,7 @@ async function getLLMData(artistsNames, apiKey) {
     return null;
   }
 
-  const prompt = `Проаналізуй музичних виконавців: ${artistsNames.join(', ')}.
+  const prompt = `Проаналізуй музичних артистів: ${artistsNames.join(', ')}.
 Для кожного надай:
 1. Повна біографія (стиль, історія, чим відомі - 1-2 абзаци).
 2. Найпопулярніший трек.
@@ -325,7 +325,7 @@ async function sendMainTrackMessage(
   const text = `
 <b>🎵 <a href="${spotifyUrl}">${artistsList} — ${escapeHtml(trackName)}</a></b>
 
-<b>Виконавці:</b> ${artistsList}
+<b>Артисти:</b> ${artistsList}
 <b>Альбом:</b> ${escapeHtml(albumName)}
 <b>Рік:</b> ${escapeHtml(year)}
   `.trim();
@@ -334,7 +334,7 @@ async function sendMainTrackMessage(
     inline_keyboard: [
       [
         {
-          text: '📖 Детальніше про виконавців',
+          text: '📖 Детальніше про артистів',
           callback_data: `details_${trackId}`,
         },
       ],
