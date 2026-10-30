@@ -100,7 +100,7 @@ async function processSpotifyLikes(env) {
 
     if (!llmData) {
       console.log(
-        '[DEBUG] LLM data unavailable. Retrying on next cron run in 2 minutes.',
+        '[DEBUG] LLM data unavailable. Retrying on next cron run.',
       );
       return;
     }
