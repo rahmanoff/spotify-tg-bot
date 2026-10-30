@@ -1,27 +1,29 @@
 # 🎵 Spotify to Telegram Music Bot
 
-A serverless Telegram bot powered by **Cloudflare Workers** that automatically tracks newly liked tracks in your **Spotify** library, analyzes artists using **Gemini LLM**, and sends rich, informative cards to Telegram.
+A serverless Telegram bot powered by **Cloudflare Workers** that automatically tracks newly liked tracks in your **Spotify** library, analyzes artists using **Gemini LLM**, and sends interactive cards with inline buttons to Telegram.
 
 ---
 
 ## 🚀 Architecture & Tech Stack
 
-- **Runtime:** [Cloudflare Workers](https://workers.cloudflare.com/) (Serverless edge computing, triggered via Cron Triggers).
-- **State Management:** Cloudflare KV (prevents duplicate runs and stores the state of the last processed track).
+- **Runtime:** [Cloudflare Workers](https://workers.cloudflare.com/) (Serverless edge computing, triggered daily via Cron Triggers and handles Telegram webhook callbacks via `fetch`).
+- **State Management:** Cloudflare KV (prevents duplicate runs, stores the state of the last processed track, and temporarily caches dynamic artist track data).
 - **External APIs:**
-  - **Spotify Web API** (Fetches liked tracks, album details, and artist metadata).
-  - **Google Gemini API (`gemini-3.8-flash`)** (Generates rich artist biographies, top tracks, and top albums).
-  - **Telegram Bot API** (Sends formatted HTML info-cards).
+  - **Spotify Web API** (Fetches liked tracks, album details, cover arts, and artist metadata/genres).
+  - **Google Gemini API (`gemini-3.5-flash-lite`)** (Generates rich artist biographies, top tracks, and top albums).
+  - **Telegram Bot API** (Sends formatted HTML info-cards with interactive inline keyboards).
 
 ---
 
-## 📋 Telegram Card Format
+## 📋 Telegram Card & Interaction Format
 
-For every newly liked track, the bot generates a message structured as follows:
-1. **Track Title & Artists** (with a direct link to Spotify).
-2. **Album Name** (or `single` if it's a standalone release) and **Release Year**.
-3. **Artist Bios** (includes individual details for every artist in collaborations).
-4. **Top Track** & **Top Album** for each artist.
+1. **Main Track Message:** 
+   - Sent automatically once a day (scheduled at 17:00 Kyiv time / 15:00 UTC).
+   - Includes the track cover art (photo), track title, artists, album name, release year, and a direct link to Spotify.
+   - Features an interactive **«📖 Детальніше про артистів»** inline button.
+2. **Detailed Artist Cards:**
+   - Triggered when the user clicks the inline button.
+   - Sends individual full-sized cards for each artist featuring their personal account photo, music genres, detailed biography, top track, and top album.
 
 ---
 
@@ -52,7 +54,7 @@ main = "src/index.js"
 compatibility_date = "2026-10-28"
 
 [triggers]
-crons = ["*/2 * * * *"] # Runs every 2 minutes
+crons = ["0 15 * * *"] # Runs once a day at 17:00 Kyiv time (15:00 UTC)
 
 [[kv_namespaces]]
 binding = "KV"
@@ -89,17 +91,20 @@ npx wrangler secret put GEMINI_API_KEY
 
 ### 5. Worker Source Code (`src/index.js`)
 
-Create the `src/index.js` file and populate it with the core worker script. It handles Spotify library syncing, lock mechanisms against parallel executions, Gemini LLM analysis with fallback support, and Telegram formatting.
+Create the `src/index.js` file and populate it with the core worker script. It handles Spotify library syncing, daily cron scheduling, Telegram webhook callbacks for inline buttons, Gemini LLM analysis using `gemini-3.5-flash-lite`, and interactive HTML card rendering.
 
 ---
 
-### 6. Deployment
+### 6. Deployment & Webhook Setup
 
-Deploy your worker directly to Cloudflare's edge network:
-
-```bash
-npx wrangler deploy
-```
+1. Deploy your worker directly to Cloudflare's edge network:
+   ```bash
+   npx wrangler deploy
+   ```
+2. Set your Telegram webhook so button clicks route correctly to your worker:
+   ```bash
+   curl -X POST "https://api.telegram.org/bot<TG_BOT_TOKEN>/setWebhook?url=<YOUR_WORKER_URL>"
+   ```
 
 ---
 
@@ -112,13 +117,13 @@ npx wrangler deploy
    ```
 
 2. **Real-time Logs:**
-   Monitor cron executions, API responses, and debugging details live:
+   Monitor cron executions, webhook callback queries, API responses, and debugging details live:
    ```bash
    npx wrangler tail
    ```
 
 3. **Verify:**
-   Like any track in your Spotify app. Within 2 minutes, the worker will pick up the change, query Spotify and Gemini, and deliver the card straight to your Telegram chat!
+   Like any track in your Spotify app. The worker will pick up the change during its scheduled run (or test manually), deliver the main card with the interactive button to your Telegram chat, and load full artist details on demand!
 
 ---
 
